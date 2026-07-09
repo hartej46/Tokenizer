@@ -1,13 +1,16 @@
+import regex as re
+import unicodedata
+
 GPT4_SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
 
 class RegexTokenizer():
     def __init__(self, regex_pattern = GPT4_SPLIT_PATTERN):
         self.regex_pattern = regex_pattern
-        self.vocab = self._build_vocab()
         self.merges = {}
         self.special_tokens = {}
-        self.compiled_pattern = re.compile(self.pattern)
-        self.inverse_special_token = {}
+        self.inverse_special_tokens = {}
+        self.compiled_pattern = re.compile(self.regex_pattern)
+        self.vocab = self._build_vocab()
         
     def _get_stats(self,ids: list[int], counts: dict[tuple[int, int], int] | None = None) -> dict[tuple[int, int], int]:
         """ 
@@ -29,13 +32,14 @@ class RegexTokenizer():
         new_ids = []
         i = 0
         while i < len(ids) - 1:
-            if ids[i] == pair[0] and ids[i] == pair[1]:
+            if ids[i] == pair[0] and ids[i+1] == pair[1]:
                 new_ids.append(idx) 
                 i += 2
             else:
                 new_ids.append(ids[i])
                 i += 1
-        
+        if i == len(ids) - 1:
+            new_ids.append(ids[i])
         return new_ids
 
     def _build_vocab(self):
@@ -43,7 +47,7 @@ class RegexTokenizer():
             This is private fn which builds vocab from start when we load this fn from somewhere,
             This fn exits so whenever you load a tokenizer , it dont have empty vocab
         """
-        vocab = {idx: bytes(idx) for idx in range(255)}
+        vocab = {idx: bytes([idx]) for idx in range(256)}
         for (p0, p1), idx in self.merges.items():
             vocab[idx] = vocab[p0] + vocab[p1]
         
@@ -56,21 +60,21 @@ class RegexTokenizer():
         ids = list(text_bytes)
 
         while len(ids) >= 2:
-            stats = get_stats(ids)
+            stats = self._get_stats(ids)
             pair = min(stats, key=lambda p: self.merges.get(p, float("inf")))
 
             if pair not in self.merges:
                 break
             
             idx = self.merges[pair]
-            ids = merge(ids, pair, idx)
+            ids = self._merges(ids, pair, idx)
 
         return ids
 
     def _replace_control_char(self, s : str) -> str:
         char = []
         for ch in s:
-            if unicodedata.category(char).startswith('C'):
+            if unicodedata.category(ch).startswith('C'):
                 char.append(f"\\u{ord(ch):04x}")
             else:
                 char.append(ch)
@@ -79,15 +83,27 @@ class RegexTokenizer():
 
     def _render_token(self, t : bytes) -> str:
         s = t.decode('utf-8', errors='replace')
-        s = self._replace_control_characters(s)
+        s = self._replace_control_char(s)
         return s
 
 
+    def register_special_tokens(self, special_tokens_dict: dict[str, int]):
+        """
+        Registers custom special tokens.
+        Example: tokenizer.register_special_tokens({"<|endoftext|>": 10001})
+        """
+        for token, idx in special_tokens_dict.items():
+            self.special_tokens[token] = idx
+            self.inverse_special_tokens[idx] = token
+            
+        self.vocab = self._build_vocab()
+
+
     def train(self, vocab_size: int, text: str, debug:bool = False) -> None:
-        assert(vocab_size >= 256, "PLease give vocab size greater than 255")
+        assert vocab_size >= 256, "PLease give vocab size greater than 255"
         num_merges = vocab_size - 256
 
-        vocab = {idx: bytes(idx) for idx in range(256)}
+        self.vocab = {idx: bytes([idx]) for idx in range(256)}
         text_chunks = re.findall(self.compiled_pattern, text)
 
         ids = [list(ch.encode("utf-8")) for ch in text_chunks]
@@ -97,21 +113,24 @@ class RegexTokenizer():
         for i in range(num_merges):
             stats = {}
             for chunk_ids in ids:
-                get_stats(chunk_ids, stats)
+                self._get_stats(chunk_ids, stats)
+
+            if not stats:
+                break
 
             pair = max(stats, key=stats.get)
             idx = 256 + i
 
-            ids = [merge(chunk_ids, pair, idx) for chunk_ids in ids]
+            ids = [self._merges(chunk_ids, pair, idx) for chunk_ids in ids]
 
             merges[pair] = idx
-            vocab[idx] = vocab[pair[0]] + vocab[pair[1]]
+            self.vocab[idx] = self.vocab[pair[0]] + self.vocab[pair[1]]
 
             if debug:
-                print(f"merge {i+1}/{num_merges}: {pair} -> {idx} ({vocab[idx]}) had {stats[pair]} occurrences")
+                print(f"merge {i+1}/{num_merges}: {pair} -> {idx} ({self._render_token(self.vocab[idx])}) had {stats[pair]} occurrences")
 
         self.merges = merges 
-        self.vocab = vocab
+        self.vocab = self._build_vocab()
 
 
     def decode(self, ids: list[int]) -> str:
@@ -144,7 +163,7 @@ class RegexTokenizer():
 
         return ids
 
-    def encode(self, text: str, special_allowed = "none_raise"):
+    def encode(self, text: str, allowed_special = "none_raise"):
         special = None
 
         if allowed_special == "all":
@@ -171,7 +190,7 @@ class RegexTokenizer():
             if char in special:
                 ids.append(special[char])
             else:
-                ids.append(self.encode_ordinary(char))
+                ids.extend(self.encode_ordinary(char))
 
         return ids
 
@@ -181,24 +200,24 @@ class RegexTokenizer():
         """
         model_file = file_prefix + ".model"
         
-        with open(model_file, 'w') as f:
+        with open(model_file, 'w', encoding="utf-8") as f:
             f.write("minbpe v1\n")
 
-            f.write(f"{self.pattern}\n")
+            f.write(f"{self.regex_pattern}\n")
 
             f.write(f"{len(self.special_tokens)}\n")
             for special, idx in self.special_tokens.items():
                 f.write(f"{special} {idx}\n")
 
-            for idx1, idx2 in self.merges:
+            for idx1, idx2 in self.merges.items():
                 f.write(f"{idx1} {idx2}\n")
 
         vocab_file = file_prefix + '.vocab'
         inverted_merges = {idx: pair for pair, idx in self.merges.items()}
 
-        with open(vocab_file, 'w') as f:
+        with open(vocab_file, 'w', encoding="utf-8") as f:
             for idx, token in self.vocab.items():
-                s = render_token(token)
+                s = self._render_token(token)
 
                 if idx in inverted_merges:
                     idx0, idx1 = inverted_merges[idx]
@@ -219,17 +238,21 @@ class RegexTokenizer():
             version = f.readline().strip()
 
             assert version == "minbpe v1"
-            self.pattern = f.readline().strip()
+            self.regex_pattern = f.readline().strip()
             num_special = int(f.readline().strip())
 
             for _ in range(num_special):
-                special, special_idx = f.readline().strip().split()
-                special_tokens[special] = int(special_idx)
+                parts = f.readline().strip().split()
+                if parts:
+                    special, special_idx = parts[0], parts[1]
+                    special_tokens[special] = int(special_idx)
 
             for line in f:
-                idx1, idx2 = map(int, line.split())
-                merges[(idx1, idx2)] = idx
-                idx += 1
+                parts = line.split()
+                if len(parts) == 2:
+                    idx1, idx2 = map(int, parts)
+                    merges[(idx1, idx2)] = idx
+                    idx += 1
 
         self.merges = merges
         self.special_tokens = special_tokens
