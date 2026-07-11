@@ -122,13 +122,10 @@ class RegexTokenizer():
             idx = 256 + i
 
             ids = [self._merges(chunk_ids, pair, idx) for chunk_ids in ids]
-
             merges[pair] = idx
             self.vocab[idx] = self.vocab[pair[0]] + self.vocab[pair[1]]
-
             if debug:
                 print(f"merge {i+1}/{num_merges}: {pair} -> {idx} ({self._render_token(self.vocab[idx])}) had {stats[pair]} occurrences")
-
         self.merges = merges 
         self.vocab = self._build_vocab()
 
@@ -248,11 +245,11 @@ class RegexTokenizer():
                     special_tokens[special] = int(special_idx)
 
             for line in f:
-                parts = line.split()
-                if len(parts) == 2:
-                    idx1, idx2 = map(int, parts)
-                    merges[(idx1, idx2)] = idx
-                    idx += 1
+                clean_line = line.replace('(', '').replace(')', '').replace(',', '')
+                parts = clean_line.split()
+                if len(parts) == 3:
+                    idx1, idx2, child_idx = map(int, parts)
+                    merges[(idx1, idx2)] = child_idx
 
         self.merges = merges
         self.special_tokens = special_tokens
